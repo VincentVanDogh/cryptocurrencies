@@ -1,5 +1,7 @@
 import ipaddress
 
+from src.message.msgexceptions import ErrorInvalidFormat
+
 """
 host
 host_formated == host for hostname and ipv4
@@ -9,7 +11,26 @@ class Peer:
         self.port = port
         self.host_formated = ''
         self.host = ''
+
         # todo: validate host_str and populate properties
+        try:
+            # Try IPv4
+            ip = ipaddress.ip_address(host_str)
+            if ip.version != 4:
+                raise ErrorInvalidFormat("Only IPv4 supported")
+            self.host = str(ip)
+            self.host_formated = self.host
+        except ErrorInvalidFormat | ValueError:
+            # Not an IP, so treat as hostname
+            if not (3 <= len(host_str) <= 50):
+                raise ErrorInvalidFormat(f"Invalid hostname length: {host_str}")
+            if not any(c.isalpha() for c in host_str):
+                raise ErrorInvalidFormat(f"Hostname missing letters: {host_str}")
+            if "." not in host_str[1:-1]:
+                raise ErrorInvalidFormat(f"Invalid hostname format: {host_str}")
+            self.host = host_str.lower()
+            self.host_formated = self.host
+            raise ErrorInvalidFormat
 
     def __str__(self) -> str:
         return f"{self.host_formated}:{self.port}"
