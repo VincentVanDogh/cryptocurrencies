@@ -13,6 +13,8 @@ import random
 import re
 import sys
 
+from src.objects import ObjectDB, get_objid, validate_object
+
 PEERS = set()
 CONNECTIONS = dict()
 BACKGROUND_TASKS = set()
@@ -24,6 +26,7 @@ LISTEN_CFG = {
     "address": const.ADDRESS,
     "port": const.PORT
 }
+object_db = ObjectDB("objects.json")
 
 
 # Add peer to your list of peers
@@ -292,7 +295,26 @@ def validate_getobject_msg(msg_dict):
 
 # raise an exception if not valid
 def validate_object_msg(msg_dict):
-    pass  # TODO
+    """
+    Validate an incoming 'object' message.
+    Returns the object ID if the object is new and valid.
+    Raises ErrorInvalidFormat if invalid.
+    """
+    obj = msg_dict.get("object")
+    if obj is None:
+        raise ErrorInvalidFormat("Missing 'object' key")
+    if not validate_object(obj):
+        raise ErrorInvalidFormat("Invalid object format")
+
+    objid = get_objid(obj)
+    if not object_db.has_object(objid):
+        object_db.add_object(obj)
+
+        # indicates a new object for gossiping
+        return objid
+
+    # object already known
+    return None
 
 
 # raise an exception if not valid
@@ -305,7 +327,7 @@ def validate_mempool_msg(msg_dict):
     pass  # todo
 
 
-def validate_msg(msg_dict):
+async def validate_msg(msg_dict):
     msg_type = msg_dict['type']
     if msg_type == 'hello':
         validate_hello_msg(msg_dict)
@@ -324,13 +346,42 @@ def validate_msg(msg_dict):
     elif msg_type == 'getobject':
         validate_getobject_msg(msg_dict)
     elif msg_type == 'object':
-        validate_object_msg(msg_dict)
+        if not validate_object_msg(msg_dict):
+            raise ErrorInvalidFormat("Invalid object message format")
+
+        obj = msg_dict["object"]
+        objid = get_objid(obj)
+
+        if not object_db.has_object(objid):
+            object_db.add_object(obj)
+            await gossip_object_to_peers(objid)
+
     elif msg_type == 'chaintip':
         validate_chaintip_msg(msg_dict)
     elif msg_type == 'mempool':
         validate_mempool_msg(msg_dict)
     else:
         raise ErrorInvalidFormat("Message type {} not valid!".format(msg_type))
+
+async def gossip_object_to_peers(objid: str):
+    msg = {
+        "type": "ihaveobject",
+        "objectid": objid
+    }
+    msg_str = json.dumps(msg) + "\n"
+
+    dead = []
+
+    for w in PEERS:
+        try:
+            w.write(msg_str.encode())
+            await w.drain()
+        except Exception:
+            dead.append(w)
+
+    # remove bad peers
+    for w in dead:
+        PEERS.remove(w)
 
 
 def handle_peers_msg(msg_dict):
@@ -493,7 +544,7 @@ async def handle_connection(reader, writer):
             try:
 
                 msg = parse_msg(msg_str)
-                validate_msg(msg)
+                await validate_msg(msg)
 
                 msg_type = msg['type']
                 if msg_type == 'hello':
