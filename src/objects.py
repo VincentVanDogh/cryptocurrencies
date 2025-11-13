@@ -11,7 +11,7 @@ import re
 import constants as const
 
 # perform syntactic checks. returns true iff check succeeded
-OBJECTID_REGEX = re.compile("^[0-9a-f]{64}$")
+OBJECTID_REGEX = re.compile(r"^[0-9a-f]{64}$")
 def validate_objectid(objid_str):
     pass # todo
 

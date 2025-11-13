@@ -11,6 +11,7 @@ class Peer:
         self.port = port
         self.host_formated = ''
         self.host = ''
+        self.isBootstrap = False
 
         # todo: validate host_str and populate properties
         try:
