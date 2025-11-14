@@ -13,7 +13,7 @@ import random
 import re
 import sys
 
-from src.objects import ObjectDB, get_objid, validate_object
+from src.objects import ObjectDB, get_objid, validate_object, validate_objectid, validate_transaction
 
 PEERS = set()
 CONNECTIONS = dict()
@@ -62,7 +62,10 @@ def add_connection(peer, queue):
 # Delete connection
 def del_connection(peer):
     ip, port = peer
-    del CONNECTIONS[Peer(ip, port)]
+    try:
+        del CONNECTIONS[Peer(ip, port)]
+    except KeyError:
+        pass
 
 
 # Make msg objects
@@ -302,19 +305,14 @@ def validate_object_msg(msg_dict):
     """
     obj = msg_dict.get("object")
     if obj is None:
-        raise ErrorInvalidFormat("Missing 'object' key")
+        raise ErrorInvalidFormat("Missing 'object' field")
+
+    # Basic syntactic validation
     if not validate_object(obj):
         raise ErrorInvalidFormat("Invalid object format")
 
-    objid = get_objid(obj)
-    if not object_db.has_object(objid):
-        object_db.add_object(obj)
-
-        # indicates a new object for gossiping
-        return objid
-
-    # object already known
-    return None
+    # Return object id but do not store it
+    return get_objid(obj)
 
 
 # raise an exception if not valid
@@ -346,42 +344,24 @@ async def validate_msg(msg_dict):
     elif msg_type == 'getobject':
         validate_getobject_msg(msg_dict)
     elif msg_type == 'object':
-        if not validate_object_msg(msg_dict):
-            raise ErrorInvalidFormat("Invalid object message format")
+        # validate syntax first; get object id
+        objid = validate_object_msg(msg_dict)
 
-        obj = msg_dict["object"]
-        objid = get_objid(obj)
+        # object already known? then nothing to do here
+        if object_db.has_object(objid):
+            return
 
-        if not object_db.has_object(objid):
-            object_db.add_object(obj)
-            await gossip_object_to_peers(objid)
-
+        # If syntactically valid and unknown, do NOT store here if you need
+        # semantic/transaction validation (do that in handle_object_msg).
+        # For now we just let the main loop call handle_object_msg which performs
+        # semantic validation, storing and gossiping.
+        return
     elif msg_type == 'chaintip':
         validate_chaintip_msg(msg_dict)
     elif msg_type == 'mempool':
         validate_mempool_msg(msg_dict)
     else:
         raise ErrorInvalidFormat("Message type {} not valid!".format(msg_type))
-
-async def gossip_object_to_peers(objid: str):
-    msg = {
-        "type": "ihaveobject",
-        "objectid": objid
-    }
-    msg_str = json.dumps(msg) + "\n"
-
-    dead = []
-
-    for w in PEERS:
-        try:
-            w.write(msg_str.encode())
-            await w.drain()
-        except Exception:
-            dead.append(w)
-
-    # remove bad peers
-    for w in dead:
-        PEERS.remove(w)
 
 
 def handle_peers_msg(msg_dict):
@@ -401,11 +381,37 @@ def handle_error_msg(msg_dict, peer_self):
 
 
 async def handle_ihaveobject_msg(msg_dict, writer):
-    pass  # TODO
+    # msg_dict must contain "objectid"
+    if 'objectid' not in msg_dict or not isinstance(msg_dict['objectid'], str):
+        raise ErrorInvalidFormat("ihaveobject missing objectid")
+
+    objid = msg_dict['objectid']
+    if not validate_objectid(objid):   # uses validate_objectid from objects.py
+        raise ErrorInvalidFormat("Invalid objectid format in ihaveobject")
+
+    # If we don't have it, request it from the sender
+    if not object_db.has_object(objid):
+        # send getobject to the peer who sent ihaveobject
+        await write_msg(writer, {"type": "getobject", "objectid": objid})
+    # else: we already have it -> ignore
 
 
 async def handle_getobject_msg(msg_dict, writer):
-    pass  # TODO
+    if 'objectid' not in msg_dict or not isinstance(msg_dict['objectid'], str):
+        raise ErrorInvalidFormat("getobject missing objectid")
+
+    objid = msg_dict['objectid']
+    if not validate_objectid(objid):
+        raise ErrorInvalidFormat("Invalid objectid format in getobject")
+
+    obj = object_db.get_object(objid)
+    if obj is None:
+        # The protocol says UNKNOWN_OBJECT is non-faulty: don't close connection.
+        # Raise a NonfaultyNodeException so the outer loop will send an error msg.
+        raise NonfaultyNodeException(f"Unknown object {objid}", "UNKNOWN_OBJECT")
+
+    # send the object
+    await write_msg(writer, {"type": "object", "object": obj})
 
 
 # return a list of transactions that tx_dict references
@@ -454,7 +460,47 @@ async def del_verify_block_task(task, objid):
 
 # what to do when an object message arrives
 async def handle_object_msg(msg_dict, peer_self, writer):
-    pass  # TODO
+    # ensure structure
+    if 'object' not in msg_dict:
+        raise ErrorInvalidFormat("object message missing 'object' key")
+
+    obj = msg_dict['object']
+    # syntactic validation (structure / type)
+    if not validate_object(obj):
+        raise ErrorInvalidFormat("Invalid object structure or unsupported type")
+
+    # for this task you only need to handle transaction objects
+    if obj.get("type") != "transaction":
+        # per exercise deviation: non-transaction = INVALID_FORMAT for now
+        raise ErrorInvalidFormat("Only transaction objects are accepted in this task")
+
+    # compute object id
+    objid = get_objid(obj)
+
+    # if we already have it -> ignore silently
+    if object_db.has_object(objid):
+        return
+
+    # Now perform transaction validation that may need referenced objects:
+    # validate_transaction_full should return (True, None) if ok,
+    # (False, "UNKNOWN_OBJECT") if missing referenced object,
+    # or (False, "some error string") on invalid.
+    valid, err = validate_transaction(obj, object_db)  # adapt to your function name/signature
+
+    if not valid:
+        if err == "UNKNOWN_OBJECT":
+            # references a missing tx -> non-faulty, tell peer it's unknown
+            raise NonfaultyNodeException(f"Referenced object unknown for {objid}", "UNKNOWN_OBJECT")
+        else:
+            # invalid transaction -> faulty peer
+            raise ErrorInvalidFormat(f"Transaction invalid: {err}")
+
+    # Passed validation -> store persistently and gossip
+    added = object_db.add_object(obj)  # returns True if actually added
+    if added:
+        # announce to all known connections
+        await gossip_object_to_peers(objid)
+    # else: race condition, someone else added it; nothing else to do
 
 
 # returns the chaintip blockid
@@ -480,7 +526,17 @@ async def handle_mempool_msg(msg_dict):
 
 # Helper function
 async def handle_queue_msg(msg_dict, writer):
-    pass  # TODO
+    """
+    Called when a queue entry is available for this connection.
+    Writes the queued message dict to the given writer.
+    """
+    try:
+        # write_msg already canonicalizes + adds newline
+        await write_msg(writer, msg_dict)
+    except Exception as e:
+        print(f"Failed to write queued message to peer: {e}")
+        # Let outer handler clean up the connection
+        raise
 
 
 # how to handle a connection
@@ -614,6 +670,23 @@ async def connect_to_node(peer: Peer):
         return
 
     await handle_connection(reader, writer)
+
+async def gossip_object_to_peers(objid: str):
+    """
+    Notify all peers we know about a new object by placing an ihaveobject
+    message in each connection's queue. CONNECTIONS maps Peer->asyncio.Queue.
+    The connection handler will pick messages from its queue and send them.
+    """
+    ihave_msg = {"type": "ihaveobject", "objectid": objid}
+    dead = []
+    # CONNECTIONS maps Peer -> asyncio.Queue
+    for peer, q in list(CONNECTIONS.items()):
+        try:
+            await q.put(ihave_msg)
+        except Exception:
+            dead.append(peer)
+    for p in dead:
+        CONNECTIONS.pop(p, None)
 
 
 async def listen():

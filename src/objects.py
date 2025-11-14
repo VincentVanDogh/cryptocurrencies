@@ -31,12 +31,46 @@ TARGET_REGEX = re.compile("^[0-9a-f]{64}$")
 def validate_target(target_str):
     return bool(TARGET_REGEX.match(target_str))
 
-def validate_transaction_input(in_dict):
-    # todo
-    return True
+def validate_transaction_input(in_dict, object_db):
+    for txin in in_dict.get("inputs", []):
+        txid = txin.get("txid")
+        index = txin.get("index")
+        sig = txin.get("signature")
+
+        if not (txid and index is not None and sig):
+            return False, "Missing input fields"
+
+        if not object_db.has_object(txid):
+            return False, "UNKNOWN_OBJECT"
+
+        prev_tx = object_db.get_object(txid)
+        outputs = prev_tx.get("outputs", [])
+        if index < 0 or index >= len(outputs):
+            return False, "Invalid outpoint"
+
+        # Verify signature
+        pubkey_hex = outputs[index]["pubkey"]
+        if not validate_pubkey(pubkey_hex):
+            return False, "Invalid pubkey"
+
+        message = canonicalize(prev_tx).decode()  # message signed
+        try:
+            pubkey_bytes = bytes.fromhex(pubkey_hex)
+            sig_bytes = bytes.fromhex(sig)
+            Ed25519PublicKey.from_public_bytes(pubkey_bytes).verify(sig_bytes, message)
+        except InvalidSignature:
+            return False, "Invalid signature"
+
+    return True, None
 
 def validate_transaction_output(out_dict):
-    # todo
+    for out in out_dict.get("outputs", []):
+        pubkey = out.get("pubkey")
+        value = out.get("value")
+        if not validate_pubkey(pubkey):
+            return False
+        if not isinstance(value, int) or value < 0:
+            return False
     return True
 
 def validate_transaction(trans_dict):
@@ -45,6 +79,41 @@ def validate_transaction(trans_dict):
     if "id" not in trans_dict or "inputs" not in trans_dict or "outputs" not in trans_dict:
         return False
     return True
+
+def validate_transaction_balance(tx_dict, object_db):
+    """
+    Weak law of conservation: sum(inputs) >= sum(outputs)
+    """
+    if len(tx_dict.get("inputs", [])) == 0:
+        # Coinbase transaction
+        return True
+
+    total_in = 0
+    for txin in tx_dict.get("inputs", []):
+        txid = txin["txid"]
+        index = txin["index"]
+        prev_tx = object_db.get_object(txid)
+        total_in += prev_tx["outputs"][index]["value"]
+
+    total_out = sum(out["value"] for out in tx_dict.get("outputs", []))
+    return total_in >= total_out
+
+def validate_transaction_full(tx_dict, object_db):
+    if tx_dict.get("type") != "transaction":
+        return False, "INVALID_FORMAT"
+
+    if not validate_transaction_output(tx_dict):
+        return False, "INVALID_FORMAT"
+
+    valid_inputs, err = validate_transaction_input(tx_dict, object_db)
+    if not valid_inputs:
+        return False, err
+
+    if not validate_transaction_balance(tx_dict, object_db):
+        return False, "INVALID_BALANCE"
+
+    return True, None
+
 
 def validate_block(block_dict):
     # todo
