@@ -3,6 +3,8 @@ from cryptography.exceptions import InvalidSignature
 from datetime import datetime
 from jcs import canonicalize
 
+from message.msgexceptions import *
+
 import copy
 import hashlib
 import json
@@ -11,150 +13,249 @@ import re
 import constants as const
 
 # perform syntactic checks. returns true iff check succeeded
-OBJECTID_REGEX = re.compile(r"^[0-9a-f]{64}$")
+OBJECTID_REGEX = re.compile("^[0-9a-f]{64}$")
 def validate_objectid(objid_str):
-    return bool(OBJECTID_REGEX.match(objid_str))
+    if not isinstance(objid_str, str):
+        return False
+    return OBJECTID_REGEX.match(objid_str)
 
 PUBKEY_REGEX = re.compile("^[0-9a-f]{64}$")
 def validate_pubkey(pubkey_str):
-    return bool(PUBKEY_REGEX.match(pubkey_str))
+    if not isinstance(pubkey_str, str):
+        return False
+    return PUBKEY_REGEX.match(pubkey_str)
 
 SIGNATURE_REGEX = re.compile("^[0-9a-f]{128}$")
 def validate_signature(sig_str):
-    return bool(SIGNATURE_REGEX.match(sig_str))
+    if not isinstance(sig_str, str):
+        return False
+    return SIGNATURE_REGEX.match(sig_str)
 
 NONCE_REGEX = re.compile("^[0-9a-f]{64}$")
 def validate_nonce(nonce_str):
-    return bool(NONCE_REGEX.match(nonce_str))
+    pass # todo
+
 
 TARGET_REGEX = re.compile("^[0-9a-f]{64}$")
 def validate_target(target_str):
-    return bool(TARGET_REGEX.match(target_str))
+    pass # todo
 
-def validate_transaction_input(in_dict, object_db):
-    for txin in in_dict.get("inputs", []):
-        txid = txin.get("txid")
-        index = txin.get("index")
-        sig = txin.get("signature")
+# syntactic checks
+def validate_transaction_input(in_dict):
+    if not isinstance(in_dict, dict):
+        raise ErrorInvalidFormat("Not a dictionary!")
 
-        if not (txid and index is not None and sig):
-            return False, "Missing input fields"
+    if 'sig' not in in_dict:
+        raise ErrorInvalidFormat("sig not set!")
+    if not isinstance(in_dict['sig'], str):
+        raise ErrorInvalidFormat("sig not a string!")
+    if not validate_signature(in_dict['sig']):
+        raise ErrorInvalidFormat("sig not syntactically valid!")
 
-        if not object_db.has_object(txid):
-            return False, "UNKNOWN_OBJECT"
+    if 'outpoint' not in in_dict:
+        raise ErrorInvalidFormat("outpoint not set!")
+    if not isinstance(in_dict['outpoint'], dict):
+        raise ErrorInvalidFormat("outpoint not a dictionary!")
 
-        prev_tx = object_db.get_object(txid)
-        outputs = prev_tx.get("outputs", [])
-        if index < 0 or index >= len(outputs):
-            return False, "Invalid outpoint"
+    outpoint = in_dict['outpoint']
+    if 'txid' not in outpoint:
+        raise ErrorInvalidFormat("txid not set!")
+    if not isinstance(outpoint['txid'], str):
+        raise ErrorInvalidFormat("txid not a string!")
+    if not validate_objectid(outpoint['txid']):
+        raise ErrorInvalidFormat("txid not a valid objectid!")
+    if 'index' not in outpoint:
+        raise ErrorInvalidFormat("index not set!")
+    if not isinstance(outpoint['index'], int):
+        raise ErrorInvalidFormat("index not an integer!")
+    if outpoint['index'] < 0:
+        raise ErrorInvalidFormat("negative index!")
+    if len(set(outpoint.keys()) - set(['txid', 'index'])) != 0:
+        raise ErrorInvalidFormat("Additional keys present in outpoint!")
 
-        # Verify signature
-        pubkey_hex = outputs[index]["pubkey"]
-        if not validate_pubkey(pubkey_hex):
-            return False, "Invalid pubkey"
+    if len(set(in_dict.keys()) - set(['sig', 'outpoint'])) != 0:
+        raise ErrorInvalidFormat("Additional keys present!")
 
-        message = canonicalize(prev_tx).decode()  # message signed
-        try:
-            pubkey_bytes = bytes.fromhex(pubkey_hex)
-            sig_bytes = bytes.fromhex(sig)
-            Ed25519PublicKey.from_public_bytes(pubkey_bytes).verify(sig_bytes, message)
-        except InvalidSignature:
-            return False, "Invalid signature"
+    return True # syntax check done
 
-    return True, None
-
+# syntactic checks
 def validate_transaction_output(out_dict):
-    for out in out_dict.get("outputs", []):
-        pubkey = out.get("pubkey")
-        value = out.get("value")
-        if not validate_pubkey(pubkey):
-            return False
-        if not isinstance(value, int) or value < 0:
-            return False
-    return True
+    if not isinstance(out_dict, dict):
+        raise ErrorInvalidFormat("Not a dictionary!")
 
+    if 'pubkey' not in out_dict:
+        raise ErrorInvalidFormat("pubkey not set!")
+    if not isinstance(out_dict['pubkey'], str):
+        raise ErrorInvalidFormat("pubkey not a string!")
+    if not validate_pubkey(out_dict['pubkey']):
+        raise ErrorInvalidFormat("pubkey not syntactically valid!")
+
+    if 'value' not in out_dict:
+        raise ErrorInvalidFormat("value not set!")
+    if not isinstance(out_dict['value'], int):
+        raise ErrorInvalidFormat("value not an integer!")
+    if out_dict['value'] < 0:
+        raise ErrorInvalidFormat("negative value!")
+
+    if len(set(out_dict.keys()) - set(['pubkey', 'value'])) != 0:
+        raise ErrorInvalidFormat("Additional keys present!")
+
+    return True # syntax check done
+
+# syntactic checks
 def validate_transaction(trans_dict):
     if not isinstance(trans_dict, dict):
-        return False
-    if "id" not in trans_dict or "inputs" not in trans_dict or "outputs" not in trans_dict:
-        return False
-    return True
+        raise ErrorInvalidFormat("Transaction object invalid: Not a dictionary!") # assert: false
 
-def validate_transaction_balance(tx_dict, object_db):
-    """
-    Weak law of conservation: sum(inputs) >= sum(outputs)
-    """
-    if len(tx_dict.get("inputs", [])) == 0:
-        # Coinbase transaction
-        return True
+    if 'type' not in trans_dict:
+        raise ErrorInvalidFormat("Transaction object invalid: Type not set") # assert: false
+    if not isinstance(trans_dict['type'], str):
+        raise ErrorInvalidFormat("Transaction object invalid: Type not a string") # assert: false
+    if not trans_dict['type'] == 'transaction':
+        raise ErrorInvalidFormat("Transaction object invalid: Type not 'transaction'") # assert: false
 
-    total_in = 0
-    for txin in tx_dict.get("inputs", []):
-        txid = txin["txid"]
-        index = txin["index"]
-        prev_tx = object_db.get_object(txid)
-        total_in += prev_tx["outputs"][index]["value"]
+    if 'outputs' not in trans_dict:
+        raise ErrorInvalidFormat("Transaction object invalid: No outputs key set")
+    if not isinstance(trans_dict['outputs'], list):
+        raise ErrorInvalidFormat("Transaction object invalid: Outputs key not a list")
 
-    total_out = sum(out["value"] for out in tx_dict.get("outputs", []))
-    return total_in >= total_out
+    index = 0
+    for output in trans_dict['outputs']:
+        try:
+            validate_transaction_output(output)
+        except ErrorInvalidFormat as e:
+            raise ErrorInvalidFormat(f"Transaction object invalid: Output at index {index} invalid: {e.message}")
+        index += 1
 
-def validate_transaction_full(tx_dict, object_db):
-    if tx_dict.get("type") != "transaction":
-        return False, "INVALID_FORMAT"
+    # check for coinbase transaction
+    if 'height' in trans_dict:
+        # this is a coinbase transaction
+        if not isinstance(trans_dict['height'], int):
+            raise ErrorInvalidFormat("Coinbase transaction object invalid: Height not an integer")
+        if trans_dict['height'] < 0:
+            raise ErrorInvalidFormat("Coinbase transaction object invalid: Negative height")
 
-    if not validate_transaction_output(tx_dict):
-        return False, "INVALID_FORMAT"
+        if len(trans_dict['outputs']) > 1:
+            raise ErrorInvalidFormat("Coinbase transaction object invalid: More than one output set")
 
-    valid_inputs, err = validate_transaction_input(tx_dict, object_db)
-    if not valid_inputs:
-        return False, err
+        if len(set(trans_dict.keys()) - set(['type', 'height', 'outputs'])) != 0:
+            raise ErrorInvalidFormat("Coinbase transaction object invalid: Additional keys present")
+        return
 
-    if not validate_transaction_balance(tx_dict, object_db):
-        return False, "INVALID_BALANCE"
+    # this is a normal transaction
+    if not 'inputs' in trans_dict:
+        raise ErrorInvalidFormat("Normal transaction object invalid: Inputs not set")
 
-    return True, None
+    if not isinstance(trans_dict['inputs'], list):
+        raise ErrorInvalidFormat("Normal transaction object invalid: Inputs not a list")
+    for input in trans_dict['inputs']:
+        try:
+            validate_transaction_input(input)
+        except ErrorInvalidFormat as e:
+            raise ErrorInvalidFormat(f"Normal transaction object invalid: Input at index {index} invalid: {e.message}")
+        index += 1
+    if len(trans_dict['inputs']) == 0:
+        raise ErrorInvalidFormat(f"Normal transaction object invalid: No input set")
+
+    if len(set(trans_dict.keys()) - set(['type', 'inputs', 'outputs'])) != 0:
+        raise ErrorInvalidFormat(f"Normal transaction object invalid: Additional key present")
+
+    return True # syntax check done
 
 
+# syntactic checks
 def validate_block(block_dict):
     # todo
     return True
 
+# syntactic checks
 def validate_object(obj_dict):
-    if "type" not in obj_dict:
-        return False
-    obj_type = obj_dict["type"]
-    if obj_type == "transaction":
+    if not isinstance(obj_dict, dict):
+        raise ErrorInvalidFormat("Object invalid: Not a dictionary!")
+
+    if 'type' not in obj_dict:
+        raise ErrorInvalidFormat("Object invalid: Type not set!")
+    if not isinstance(obj_dict['type'], str):
+        raise ErrorInvalidFormat("Object invalid: Type not a string")
+
+    obj_type = obj_dict['type']
+    if obj_type == 'transaction':
         return validate_transaction(obj_dict)
-    elif obj_type == "block":
-        return validate_block(obj_dict)
-    else:
-        # unsupported object type
-        return False
+    elif obj_type == 'block':
+        pass # return validate_block(obj_dict)
+
+    raise ErrorInvalidFormat("Object invalid: Unknown object type")
+
+def expand_object(obj_str):
+    return json.loads(obj_str)
 
 def get_objid(obj_dict):
-    canonical_bytes = canonicalize(obj_dict)
-    h = hashlib.blake2s()
-    h.update(canonical_bytes)
-    return h.hexdigest()
+    return hashlib.blake2s(canonicalize(obj_dict)).hexdigest()
 
 # perform semantic checks
 
 # verify the signature sig in tx_dict using pubkey
 def verify_tx_signature(tx_dict, sig, pubkey):
+    tx_local = copy.deepcopy(tx_dict)
+
+    for i in tx_local['inputs']:
+        i['sig'] = None
+
+    pubkey_obj = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey))
+    sig_bytes = bytes.fromhex(sig)
+
     try:
-        pubkey_obj = Ed25519PublicKey.from_public_bytes(bytes.fromhex(pubkey))
-        pubkey_obj.verify(bytes.fromhex(sig), canonicalize(tx_dict))
-        return True
+        pubkey_obj.verify(sig_bytes, canonicalize(tx_local))
     except InvalidSignature:
         return False
-    except Exception:
-        return False
+
+    return True
 
 class TXVerifyException(Exception):
     pass
 
+# semantic checks
+# assert: tx_dict is syntactically valid
 def verify_transaction(tx_dict, input_txs):
-    pass # todo 
+    # coinbase transaction
+    if 'height' in tx_dict:
+        return # assume all syntactically valid coinbase transactions are valid
+
+    # regular transaction
+    insum = 0 # sum of input values
+    in_dict = dict()
+    for i in tx_dict['inputs']:
+        ptxid = i['outpoint']['txid']
+        ptxidx = i['outpoint']['index']
+
+        if ptxid in in_dict:
+            if ptxidx in in_dict[ptxid]:
+                raise ErrorInvalidTxConservation(f"The same input ({ptxid}, {ptxidx}) was used multiple times in this transaction")
+            else:
+                in_dict[ptxid].add(ptxidx)
+        else:
+            in_dict[ptxid] = {ptxidx}
+
+        if ptxid not in input_txs:
+            raise ErrorUnknownObject(f"Transaction {ptxid} not known")
+
+        ptx_dict = input_txs[ptxid]
+
+        # just to be sure
+        if ptx_dict['type'] != 'transaction':
+            raise ErrorInvalidFormat("Previous TX '{}' is not a transaction!".format(ptxid))
+
+        if ptxidx >= len(ptx_dict['outputs']):
+            raise ErrorInvalidTxOutpoint("Invalid output index in previous TX '{}'!".format(ptxid))
+
+        output = ptx_dict['outputs'][ptxidx]
+        if not verify_tx_signature(tx_dict, i['sig'], output['pubkey']):
+            raise ErrorInvalidTxSignature("Invalid signature from previous TX '{}'!".format(ptxid))
+
+        insum = insum + output['value']
+
+    if insum < sum([o['value'] for o in tx_dict['outputs']]):
+        raise ErrorInvalidTxConservation("Sum of inputs < sum of outputs!")
 
 class BlockVerifyException(Exception):
     pass
@@ -169,31 +270,3 @@ def update_utxo_and_calculate_fee(tx, utxo):
 def verify_block(block, prev_block, prev_utxo, prev_height, txs):
     # todo
     return 0
-
-class ObjectDB:
-    """Stores known objects persistently."""
-    def __init__(self, filename="objects.json"):
-        self.filename = filename
-        try:
-            with open(filename, "r") as f:
-                self.db = json.load(f)
-        except (FileNotFoundError, json.JSONDecodeError):
-            self.db = {}
-
-    def add_object(self, obj_dict):
-        objid = get_objid(obj_dict)
-        if objid in self.db:
-            return False
-        self.db[objid] = obj_dict
-        self._persist()
-        return True
-
-    def has_object(self, objid):
-        return objid in self.db
-
-    def get_object(self, objid):
-        return self.db.get(objid, None)
-
-    def _persist(self):
-        with open(self.filename, "w") as f:
-            json.dump(self.db, f, indent=2)
