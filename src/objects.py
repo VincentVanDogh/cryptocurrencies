@@ -33,12 +33,15 @@ def validate_signature(sig_str):
 
 NONCE_REGEX = re.compile("^[0-9a-f]{64}$")
 def validate_nonce(nonce_str):
-    pass # todo
-
+    if not isinstance(nonce_str, str):
+        return False
+    return NONCE_REGEX.match(nonce_str)
 
 TARGET_REGEX = re.compile("^[0-9a-f]{64}$")
 def validate_target(target_str):
-    pass # todo
+    if not isinstance(target_str, str):
+        return False
+    return TARGET_REGEX.match(target_str)
 
 # syntactic checks
 def validate_transaction_input(in_dict):
@@ -165,7 +168,42 @@ def validate_transaction(trans_dict):
 
 # syntactic checks
 def validate_block(block_dict):
-    # todo
+    # Implement syntactic checks for block structure
+    if not isinstance(block_dict, dict):
+        raise ErrorInvalidFormat("Block invalid: Not a dictionary!")
+
+    if 'type' not in block_dict:
+        raise ErrorInvalidFormat("Block invalid: Type not set!")
+    if not isinstance(block_dict['type'], str):
+        raise ErrorInvalidFormat("Block invalid: Type not a string")
+    if block_dict['type'] != 'block':
+        raise ErrorInvalidFormat("Block invalid: type not 'block'")
+
+    # required fields
+    required = ['T', 'created', 'miner', 'nonce', 'txids', 'type']
+    for k in required:
+        if k not in block_dict:
+            raise ErrorInvalidFormat(f"Block invalid: {k} missing")
+
+    if not isinstance(block_dict['T'], str) or not validate_target(block_dict['T']):
+        raise ErrorInvalidFormat("Block invalid: T invalid")
+    if not isinstance(block_dict['created'], int):
+        raise ErrorInvalidFormat("Block invalid: created not int")
+    if not isinstance(block_dict['miner'], str):
+        raise ErrorInvalidFormat("Block invalid: miner not str")
+    if not isinstance(block_dict['nonce'], str) or not validate_nonce(block_dict['nonce']):
+        raise ErrorInvalidFormat("Block invalid: nonce invalid")
+    if not isinstance(block_dict['txids'], list):
+        raise ErrorInvalidFormat("Block invalid: txids not a list")
+    for txid in block_dict['txids']:
+        if not isinstance(txid, str) or not validate_objectid(txid):
+            raise ErrorInvalidFormat("Block invalid: txid in txids invalid")
+
+    # previd may be None or a valid objectid
+    if 'previd' in block_dict and block_dict['previd'] is not None:
+        if not validate_objectid(block_dict['previd']):
+            raise ErrorInvalidFormat("Block invalid: previd invalid")
+
     return True
 
 # syntactic checks
@@ -182,7 +220,7 @@ def validate_object(obj_dict):
     if obj_type == 'transaction':
         return validate_transaction(obj_dict)
     elif obj_type == 'block':
-        pass # return validate_block(obj_dict)
+        return validate_block(obj_dict)
 
     raise ErrorInvalidFormat("Object invalid: Unknown object type")
 
@@ -261,12 +299,159 @@ class BlockVerifyException(Exception):
     pass
 
 # apply tx to utxo
-# returns mining fee
+# utxo: dict mapping (txid, index) -> value
+# returns mining fee (int)
 def update_utxo_and_calculate_fee(tx, utxo):
-    # todo
-    return 0
+    # coinbase transaction: 'height' present
+    if 'height' in tx:
+        # coinbase: add its outputs, fee is 0 (fee accounted separately)
+        for idx, out in enumerate(tx['outputs']):
+            utxo[(get_objid(tx), idx)] = out['value']
+        return 0
+
+    # regular tx: compute sum of input values, remove spent UTXOs, add outputs
+    insum = 0
+    for inp in tx['inputs']:
+        ptxid = inp['outpoint']['txid']
+        ptxidx = inp['outpoint']['index']
+        key = (ptxid, ptxidx)
+        if key not in utxo:
+            raise ErrorInvalidTxOutpoint(f"Spending non-existing or already spent output {key}")
+        insum += utxo[key]
+
+    outs_sum = sum(o['value'] for o in tx['outputs'])
+    if insum < outs_sum:
+        raise ErrorInvalidTxConservation("Sum of inputs < sum of outputs!")
+
+    # consume inputs
+    for inp in tx['inputs']:
+        ptxid = inp['outpoint']['txid']
+        ptxidx = inp['outpoint']['index']
+        key = (ptxid, ptxidx)
+        # remove spent output
+        del utxo[key]
+
+    # add outputs
+    txid = get_objid(tx)
+    for idx, out in enumerate(tx['outputs']):
+        utxo[(txid, idx)] = out['value']
+
+    fee = insum - outs_sum
+    return fee
 
 # verify that a block is valid in the current chain state, using known transactions txs
+# - block: block dict
+# - prev_block: previous block dict or None
+# - prev_utxo: dict mapping (txid, index) -> value (snapshot after prev_block)
+# - prev_height: height of prev_block (int) or None
+# - txs: dict mapping txid -> transaction dicts that are known locally (from DB)
+# Returns: new_utxo dict mapping (txid, index) -> value on success
 def verify_block(block, prev_block, prev_utxo, prev_height, txs):
-    # todo
-    return 0
+    # syntactic checks first
+    validate_block(block)
+
+    # 1) Target must be the network target
+    if block['T'] != const.BLOCK_TARGET:
+        raise ErrorInvalidFormat("Block target does not match required target")
+
+    # 2) Proof-of-work: use SHA256(canonicalize(block)) <= T
+    pow_hash = hashlib.sha256(canonicalize(block)).hexdigest()
+    if int(pow_hash, 16) > int(block['T'], 16):
+        raise ErrorInvalidFormat("Invalid proof-of-work for block")
+
+    # 3) Parent existence: prev_block argument indicates if parent known
+    if block.get('previd') is not None:
+        if prev_block is None:
+            # caller must handle sending UNKNOWN_OBJECT and pending logic
+            raise ErrorUnknownObject(f"Missing parent block {block.get('previd')}")
+
+    # 4) Ensure we have all transactions in this block (txs param should hold them)
+    for txid in block['txids']:
+        if txid not in txs:
+            raise ErrorUnknownObject(f"Missing transaction {txid}")
+
+    # 5) Now validate transactions sequentially and update UTXO
+    # Make a working copy of prev_utxo
+    working_utxo = copy.deepcopy(prev_utxo) if prev_utxo is not None else {}
+
+    # Prepare a mapping of txid -> txdict for transactions that are "available" for signature checks.
+    # Start with txs (transactions from DB) and add processed transactions from this block as we go.
+    available_txs = dict(txs)  # shallow copy
+
+    coinbase_count = 0
+    coinbase_txid = None
+
+    total_fees = 0
+
+    for idx, txid in enumerate(block['txids']):
+        tx = txs[txid]
+
+        # Check syntactic validity of transaction
+        try:
+            validate_transaction(tx)
+        except ErrorInvalidFormat as e:
+            raise e
+
+        # detect coinbase
+        is_coinbase = 'height' in tx
+
+        if is_coinbase:
+            coinbase_count += 1
+            if coinbase_count > 1:
+                raise ErrorInvalidFormat("More than one coinbase transaction in block")
+            if idx != 0:
+                raise ErrorInvalidFormat("Coinbase transaction must be at index 0 in txids")
+            coinbase_txid = txid
+
+        # build input_txs mapping for verify_transaction: all referenced txids must be present in available_txs
+        # (available_txs already contains txs from DB and previously processed txs in the block)
+        input_txs = {}
+        # Collect referenced txids
+        if not is_coinbase:
+            for inp in tx['inputs']:
+                ptxid = inp['outpoint']['txid']
+                if ptxid not in available_txs:
+                    # Missing referenced transaction for signature verification
+                    raise ErrorUnknownObject(f"Missing referenced transaction {ptxid}")
+                input_txs[ptxid] = available_txs[ptxid]
+
+            # perform semantic checks (signature, double usage within tx, conservation)
+            verify_transaction(tx, input_txs)
+
+        # Ensure coinbase is not spent within same block: if any later tx refers to coinbase txid -> reject
+        if is_coinbase:
+            # add coinbase to available_txs (so later txs could reference it, but specification forbids it)
+            available_txs[txid] = tx
+            # Apply coinbase to utxo (no fee)
+            # But per spec, coinbase cannot be spent in same block; we'll check when processing later transactions
+            # Add outputs
+            for out_idx, out in enumerate(tx['outputs']):
+                working_utxo[(txid, out_idx)] = out['value']
+            # fee = 0 for coinbase (we track fees from non-coinbase txs)
+        else:
+            # For regular txs: check UTXO inputs exist in working_utxo
+            # update_utxo_and_calculate_fee will raise an exception if outpoint not present
+            fee = update_utxo_and_calculate_fee(tx, working_utxo)
+            total_fees += fee
+            # add to available txs (so future txs in same block can spend its outputs)
+            available_txs[txid] = tx
+
+        # After adding tx to available_txs, ensure that no transaction earlier in the block attempted to spend coinbase
+        if coinbase_txid is not None and idx > 0:
+            # Check inputs of this tx (if any) do not reference coinbase_txid
+            if 'inputs' in tx:
+                for inp in tx['inputs']:
+                    if inp['outpoint']['txid'] == coinbase_txid:
+                        raise ErrorInvalidFormat("Coinbase transaction spent within same block (not allowed)")
+
+    # 6) Validate coinbase output constraint: coinbase output <= sum(fees) + BLOCK_REWARD
+    if coinbase_count == 1:
+        # coinbase is tx at index 0
+        cbtx = txs[block['txids'][0]]
+        cb_value = cbtx['outputs'][0]['value']
+        max_allowed = total_fees + const.BLOCK_REWARD
+        if cb_value > max_allowed:
+            raise ErrorInvalidFormat("Coinbase output exceeds fees + block reward")
+
+    # If all checks passed, return the new utxo set
+    return working_utxo
